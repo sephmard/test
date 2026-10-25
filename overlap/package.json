@@ -1,0 +1,15 @@
+{
+  "name": "overlap",
+  "version": "0.1.0",
+  "description": "Free, no-signup scheduling polls: share a link, everyone paints their availability, see the best time.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "dev:worker": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}
