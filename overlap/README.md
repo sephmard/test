@@ -1,6 +1,11 @@
 # Overlap
 
-A free, open-source alternative to Doodle for finding a time to meet. Create a poll, share one link, and everyone paints when they're free. Overlap shows the best time straight away.
+A free, open-source alternative to Doodle for finding a time to meet. Propose some times, share one link, and everyone marks what works. Overlap shows the best time straight away.
+
+Two kinds of poll:
+
+- **Propose specific times** (default): you suggest exact times, like "Tue 2pm, Wed 10am". Invitees answer each one with *Yes*, *If needed* or *No*, like a survey.
+- **Open time range**: you pick days and an hours window, and people paint when they're free on a grid (like when2meet).
 
 ## Why it's better than Doodle
 
@@ -8,19 +13,22 @@ A free, open-source alternative to Doodle for finding a time to meet. Create a p
 |---|---|---|
 | Accounts | Organizer must sign up | None, for anyone |
 | Ads / tracking | Yes | None |
-| Picking availability | One checkbox per option | Click-and-drag painting across days and hours (touch friendly) |
+| Proposing times | Type each option | Pick dates on a calendar, add times with one click, and copy a day's times to every day |
+| Answering | Small checkboxes | Big Yes / If needed / No buttons per time with live tallies, or click-and-drag painting for range polls |
 | "If needed" answers | Yes | Yes |
 | Time zones | Confusing for participants | Every viewer sees times in their own zone, and can switch zones |
 | Meeting length | You pre-pick fixed options | Ranks every start time where people can make the *whole* meeting |
-| Your calendar | Paid feature | Import an `.ics` export to fill in your free time, privately in your browser |
+| Your calendar | Paid feature | Check an `.ics` export against the proposed times, privately in your browser |
 | Finalizing | Paid features for invites | Pick the time, then everyone gets Google / Outlook / Apple calendar links |
 | Hosting | Their servers | Yours, free on Cloudflare or any Node host |
 
 ## How it works
 
-1. **Create**: name the poll, drag across a calendar to choose dates, set the daily window, slot size (15/30/60 min) and meeting length.
-2. **Share**: send the link. People enter a name and paint *Available*, *If needed* or *Busy*. They can also import a calendar file.
-3. **Decide**: the **Best times** list ranks start times by how many people can attend the full meeting. Hover a cell to see who's in. Tap a name to view just their availability.
+1. **Create**: name the poll and pick dates on the calendar.
+   - *Specific times*: add the times you want to propose for each date. "Use these times on every day" copies them across.
+   - *Open range*: set the daily window, slot size (15/30/60 min) and meeting length.
+2. **Share**: send the link. People enter their name and answer each time (or paint the grid). They can also check against a calendar file. They don't need an account.
+3. **Decide**: **Best times** ranks options by how many people can make it, then by firm yeses. The **Everyone** table shows who answered what, Doodle-style, with the most popular times highlighted.
 4. **Finalize**: the organizer picks a time. The poll then shows add-to-calendar buttons for everyone.
 
 Secrets for the organizer and for each participant's edits live in the URL *fragment*, which is never sent to the server, and in the browser's local storage. Only their SHA-256 hashes are stored on the server. Personal "edit links" let people edit their response from another device.
@@ -70,7 +78,7 @@ test/            node:test suites
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/events` | Create a poll → `{ id, adminToken }` |
+| `POST` | `/api/events` | Create a poll → `{ id, adminToken }`. Specific times: `{ mode: "options", options: [{ start, end }] }` (UTC ms) |
 | `GET` | `/api/events/:id` | Poll + responses (`x-admin-token` header sets `isAdmin`) |
 | `DELETE` | `/api/events/:id` | Organizer only |
 | `POST` | `/api/events/:id/participants` | `{ name, availability }` → `{ id, editToken }` |
@@ -78,7 +86,7 @@ test/            node:test suites
 | `POST` | `/api/events/:id/finalize` | `{ start }` or `{ start: null }`, organizer only |
 | `GET` | `/api/events/:id/event.ics` | Calendar file for the final time |
 
-`availability` maps slot start (UTC ms) → `2` (available) or `1` (if needed).
+`availability` maps an option or slot start (UTC ms) → `2` (yes) or `1` (if needed). Anything missing means no.
 
 ## Ideas for next steps
 

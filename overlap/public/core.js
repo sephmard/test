@@ -11,6 +11,7 @@ export const LIMITS = {
   dates: 62,
   slots: 2500,
   participants: 300,
+  options: 100,
 };
 
 const MINUTE = 60_000;
@@ -137,6 +138,8 @@ export function normalizeEventInput(input) {
   const timezone = input.timezone;
   if (!isValidTimeZone(timezone)) throw new ValidationError('Unknown time zone');
 
+  if (input.mode === 'options') return normalizeOptionsEvent(input, { title, description, organizer, timezone });
+
   if (!Array.isArray(input.dates) || input.dates.length === 0)
     throw new ValidationError('Pick at least one date');
   const dates = [...new Set(input.dates)].sort();
@@ -166,8 +169,40 @@ export function normalizeEventInput(input) {
   return ev;
 }
 
-/** All slot start instants (UTC ms), sorted, for an event. */
+// "Specific times" poll: the organizer proposes exact options and people vote on each.
+const MIN_TIME = Date.UTC(2000, 0, 1);
+const MAX_TIME = Date.UTC(2100, 0, 1);
+
+function normalizeOptionsEvent(input, base) {
+  if (!Array.isArray(input.options) || input.options.length === 0)
+    throw new ValidationError('Propose at least one time');
+  if (input.options.length > LIMITS.options) throw new ValidationError(`Propose at most ${LIMITS.options} times`);
+  const seen = new Set();
+  const options = [];
+  for (const o of input.options) {
+    const start = Number(o?.start), end = Number(o?.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < MIN_TIME || end > MAX_TIME || start % MINUTE || end % MINUTE)
+      throw new ValidationError('Invalid proposed time');
+    if (end <= start || end - start > DAY) throw new ValidationError('Each proposed time must last between 1 minute and 24 hours');
+    if (seen.has(start)) throw new ValidationError('Two proposed times start at the same moment');
+    seen.add(start);
+    options.push({ start, end });
+  }
+  options.sort((a, b) => a.start - b.start);
+  return { ...base, mode: 'options', options, durationMinutes: (options[0].end - options[0].start) / MINUTE };
+}
+
+export const isOptionsPoll = (ev) => ev.mode === 'options';
+
+/** End instant of the meeting that starts at `start`. */
+export function meetingEnd(ev, start) {
+  if (isOptionsPoll(ev)) return ev.options.find((o) => o.start === start)?.end ?? start + ev.durationMinutes * MINUTE;
+  return start + ev.durationMinutes * MINUTE;
+}
+
+/** All slot start instants (UTC ms), sorted, for an event. For option polls, one per option. */
 export function buildSlots(ev) {
+  if (isOptionsPoll(ev)) return ev.options.map((o) => o.start);
   const set = new Set();
   for (const date of ev.dates) {
     for (let m = ev.startMinute; m < ev.endMinute; m += ev.slotMinutes) {
@@ -203,6 +238,7 @@ export function normalizeName(name) {
  * Returns [{start, end, yes:[names], ifNeeded:[names], no:[names]}], best first.
  */
 export function rankTimes(ev, slots, participants, limit = 5) {
+  if (isOptionsPoll(ev)) return rankOptions(ev, participants, limit);
   const slotMs = ev.slotMinutes * MINUTE;
   const k = Math.max(1, Math.round(ev.durationMinutes / ev.slotMinutes));
   const results = [];
@@ -218,13 +254,30 @@ export function rankTimes(ev, slots, participants, limit = 5) {
     if (yes.length + ifNeeded.length === 0) continue;
     results.push({ start, end: start + k * slotMs, yes, ifNeeded, no });
   }
-  results.sort(
+  return sortRanked(results).slice(0, limit);
+}
+
+function rankOptions(ev, participants, limit) {
+  const results = [];
+  for (const { start, end } of ev.options) {
+    const yes = [], ifNeeded = [], no = [];
+    for (const p of participants) {
+      const v = p.availability[start];
+      (v === YES ? yes : v === IF_NEEDED ? ifNeeded : no).push(p.name);
+    }
+    if (yes.length + ifNeeded.length === 0) continue;
+    results.push({ start, end, yes, ifNeeded, no });
+  }
+  return sortRanked(results).slice(0, limit);
+}
+
+function sortRanked(results) {
+  return results.sort(
     (a, b) =>
       b.yes.length + b.ifNeeded.length - (a.yes.length + a.ifNeeded.length) ||
       b.yes.length - a.yes.length ||
       a.start - b.start,
   );
-  return results.slice(0, limit);
 }
 
 // ---------- calendar export ----------
@@ -435,21 +488,17 @@ function expandRrule(start, r, rangeEnd) {
   return out;
 }
 
-/** Turn busy intervals into an availability map: free slots = YES, busy slots omitted. */
-export function availabilityFromBusy(slots, slotMinutes, busy) {
-  const slotMs = slotMinutes * MINUTE;
+/** Which windows of an event (grid slots or proposed options) as [{start, end}]. */
+export function eventWindows(ev) {
+  if (isOptionsPoll(ev)) return ev.options;
+  return buildSlots(ev).map((s) => ({ start: s, end: s + ev.slotMinutes * MINUTE }));
+}
+
+/** Turn busy intervals into an availability map: free windows = YES, busy ones omitted. */
+export function availabilityFromBusy(windows, busy) {
   const out = {};
-  let j = 0;
-  for (const s of slots) {
-    while (j < busy.length && busy[j].end <= s) j++;
-    let conflict = false;
-    for (let i = j; i < busy.length && busy[i].start < s + slotMs; i++) {
-      if (busy[i].end > s) {
-        conflict = true;
-        break;
-      }
-    }
-    if (!conflict) out[s] = YES;
+  for (const w of windows) {
+    if (!busy.some((b) => b.start < w.end && b.end > w.start)) out[w.start] = YES;
   }
   return out;
 }

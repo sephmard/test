@@ -5,6 +5,7 @@ import {
   ValidationError,
   buildIcs,
   buildSlots,
+  meetingEnd,
   normalizeAvailability,
   normalizeEventInput,
   normalizeName,
@@ -103,7 +104,7 @@ export async function handleApi(request, store, { now = Date.now } = {}) {
         title: ev.title,
         description: ev.description,
         start: ev.finalStart,
-        end: ev.finalStart + ev.durationMinutes * 60_000,
+        end: meetingEnd(ev, ev.finalStart),
         url: `${url.origin}/e/${ev.id}`,
       });
       return new Response(body, {

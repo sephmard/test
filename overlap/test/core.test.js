@@ -6,6 +6,8 @@ import {
   availabilityFromBusy,
   buildIcs,
   buildSlots,
+  eventWindows,
+  meetingEnd,
   normalizeAvailability,
   normalizeEventInput,
   parseIcsBusy,
@@ -105,7 +107,7 @@ test('parseIcsBusy handles UTC, TZID, weekly recurrence, EXDATE and free/cancell
   const busy = parseIcsBusy(ics, slots[0], slots.at(-1) + 30 * 60_000, 'UTC');
   // Nov 2 9:00 ET (weekly), Nov 2 9:30 ET (one-off). Nov 3 is excluded via EXDATE.
   assert.deepEqual(busy.map((b) => b.start), [zonedToUtc('2026-11-02', 540, 'America/New_York'), Date.UTC(2026, 10, 2, 14, 30)]);
-  const av = availabilityFromBusy(slots, 30, busy);
+  const av = availabilityFromBusy(slots.map((s) => ({ start: s, end: s + 30 * 60_000 })), busy);
   assert.deepEqual(Object.keys(av).map(Number), slots.slice(2));
 });
 
@@ -136,4 +138,49 @@ test('buildIcs escapes text', () => {
   assert.match(ics, /SUMMARY:A\\, B\\; C/);
   assert.match(ics, /DESCRIPTION:line1\\nline2/);
   assert.match(ics, /DTSTART:19700101T000000Z/);
+});
+
+const H = 3_600_000;
+const t0 = Date.UTC(2026, 10, 3, 14);
+const optionsPoll = {
+  title: 'Lunch',
+  timezone: 'UTC',
+  mode: 'options',
+  options: [
+    { start: t0 + 24 * H, end: t0 + 25 * H },
+    { start: t0, end: t0 + H },
+    { start: t0 + 3 * H, end: t0 + 3.5 * H },
+  ],
+};
+
+test('specific-times polls are validated and sorted', () => {
+  const ev = normalizeEventInput(optionsPoll);
+  assert.equal(ev.mode, 'options');
+  assert.deepEqual(ev.options.map((o) => o.start), [t0, t0 + 3 * H, t0 + 24 * H]);
+  assert.deepEqual(buildSlots(ev), [t0, t0 + 3 * H, t0 + 24 * H]);
+  assert.equal(meetingEnd(ev, t0 + 3 * H), t0 + 3.5 * H);
+  assert.throws(() => normalizeEventInput({ ...optionsPoll, options: [] }), /at least one/);
+  assert.throws(() => normalizeEventInput({ ...optionsPoll, options: [{ start: t0, end: t0 }] }), /last between/);
+  assert.throws(() => normalizeEventInput({ ...optionsPoll, options: [{ start: t0, end: t0 + H }, { start: t0, end: t0 + 2 * H }] }), /same moment/);
+  assert.throws(() => normalizeEventInput({ ...optionsPoll, options: [{ start: 'x', end: 1 }] }), /Invalid/);
+});
+
+test('specific-times polls rank each option on its own', () => {
+  const ev = normalizeEventInput(optionsPoll);
+  const [a, b, c] = buildSlots(ev);
+  const people = [
+    { name: 'Ann', availability: { [a]: YES, [c]: YES } },
+    { name: 'Bob', availability: { [a]: IF_NEEDED, [c]: YES } },
+    { name: 'Cy', availability: { [b]: YES } },
+  ];
+  const best = rankTimes(ev, buildSlots(ev), people);
+  assert.deepEqual(best.map((r) => r.start), [c, a, b]);
+  assert.equal(best[0].end, c + H);
+  assert.deepEqual(best[1].ifNeeded, ['Bob']);
+});
+
+test('calendar import checks each proposed time against busy events', () => {
+  const ev = normalizeEventInput(optionsPoll);
+  const busy = [{ start: t0 + 3.25 * H, end: t0 + 4 * H }];
+  assert.deepEqual(Object.keys(availabilityFromBusy(eventWindows(ev), busy)).map(Number), [t0, t0 + 24 * H]);
 });

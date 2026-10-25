@@ -8,8 +8,12 @@ import {
   outlookCalendarUrl,
   pad,
   parseIcsBusy,
+  eventWindows,
+  isOptionsPoll,
+  meetingEnd,
   rankTimes,
   utcToZoned,
+  zonedToUtc,
 } from './core.js';
 
 const app = document.getElementById('app');
@@ -149,18 +153,33 @@ window.addEventListener('popstate', route);
 function renderCreate() {
   document.title = 'Overlap: find a time that works';
   const selected = new Set();
+  const times = new Map(); // date -> Set of minutes after midnight (specific-times polls)
+  let mode = 'options';
   let cursor = new Date();
   cursor = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
 
   const hourOptions = (sel) =>
     Array.from({ length: 25 }, (_, h) => `<option value="${h * 60}"${h * 60 === sel ? ' selected' : ''}>${minutesLabel(h * 60 % 1440)}${h === 24 ? ' (midnight)' : ''}</option>`).join('');
+  const lengthOptions = (sel) =>
+    [15, 30, 45, 60, 90, 120, 180, 240].map((d) => `<option value="${d}"${d === sel ? ' selected' : ''}>${lengthLabel(d)}</option>`).join('');
 
   app.innerHTML = `
     <section class="hero">
       <h1>Find a time that works for everyone</h1>
-      <p class="muted">Pick some dates, share one link, and everyone paints when they're free. Overlap shows you the best time right away. No accounts, no ads.</p>
+      <p class="muted">Propose some times, share one link, and everyone marks what works for them. You see the best time right away. No accounts, no ads.</p>
     </section>
-    <form id="create" class="create-grid" novalidate>
+    <form id="create" novalidate>
+      <div class="mode-pick" role="radiogroup" aria-label="Poll type">
+        <button type="button" role="radio" data-mode="options">
+          <b>Propose specific times</b>
+          <span>You suggest exact times, and people say which ones work.</span>
+        </button>
+        <button type="button" role="radio" data-mode="grid">
+          <b>Open time range</b>
+          <span>People paint when they're free across the days and hours you pick.</span>
+        </button>
+      </div>
+      <div class="create-grid">
       <div class="card stack">
         <div>
           <label for="title">What are you planning?</label>
@@ -174,11 +193,15 @@ function renderCreate() {
           <label for="organizer">Your name <span class="muted">(optional)</span></label>
           <input id="organizer" type="text" maxlength="80" value="${esc(lastName())}">
         </div>
-        <div class="row">
+        <div data-for="options">
+          <label for="length">Meeting length</label>
+          <select id="length">${lengthOptions(60)}</select>
+        </div>
+        <div class="row" data-for="grid">
           <div><label for="start">From</label><select id="start">${hourOptions(9 * 60)}</select></div>
           <div><label for="end">Until</label><select id="end">${hourOptions(17 * 60)}</select></div>
         </div>
-        <div class="row">
+        <div class="row" data-for="grid">
           <div>
             <label for="slot">Slot size</label>
             <select id="slot"><option value="15">15 min</option><option value="30" selected>30 min</option><option value="60">1 hour</option></select>
@@ -192,6 +215,7 @@ function renderCreate() {
         </div>
       </div>
       <div class="card">
+        <h2 class="step"><span>1</span> Pick dates</h2>
         <div class="cal-head">
           <button type="button" class="btn btn-sm" id="prev" aria-label="Previous month">‹</button>
           <h2 id="month" style="margin:0"></h2>
@@ -204,15 +228,28 @@ function renderCreate() {
           <button type="button" class="btn btn-sm btn-ghost" id="clear">Clear</button>
         </div>
         <p class="small muted" id="count" style="margin:12px 0 0">Click or drag to pick dates.</p>
+        <div data-for="options" style="margin-top:20px">
+          <h2 class="step"><span>2</span> Add the times you want to propose</h2>
+          <div id="times"></div>
+        </div>
         <div class="btn-row" style="margin-top:16px">
           <button class="btn btn-primary" type="submit" id="submit">Create poll</button>
+          <span class="small muted" id="summary"></span>
         </div>
         <div class="error" id="err" role="alert"></div>
+      </div>
       </div>
     </form>`;
 
   const cal = $('#cal');
   const today = todayStr();
+
+  function renderMode() {
+    for (const b of app.querySelectorAll('[data-mode]')) b.setAttribute('aria-checked', b.dataset.mode === mode);
+    for (const el of app.querySelectorAll('[data-for]')) el.hidden = el.dataset.for !== mode;
+    renderSummary();
+  }
+  for (const b of app.querySelectorAll('[data-mode]')) b.onclick = () => { mode = b.dataset.mode; renderMode(); };
 
   function renderCal() {
     $('#month').textContent = cursor.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
@@ -230,6 +267,91 @@ function renderCreate() {
     const n = selected.size;
     $('#count').textContent = n ? `${n} date${n > 1 ? 's' : ''} selected` : 'Click or drag to pick dates.';
     $('#prev').disabled = y === new Date().getFullYear() && m === new Date().getMonth();
+    renderTimes();
+  }
+
+  // ----- proposed times, per date -----
+  const timeChoices = Array.from({ length: 96 }, (_, i) => i * 15);
+  const dayLabel = (d) => `${fmtDow.format(dateParts(d))}, ${fmtMonthDay.format(dateParts(d))}`;
+  const suggestNext = (date) => {
+    const set = times.get(date);
+    if (!set?.size) return 540;
+    const next = Math.max(...set) + +$('#length').value;
+    return next < 1440 ? Math.ceil(next / 15) * 15 % 1440 : 540;
+  };
+
+  function renderTimes() {
+    const box = $('#times');
+    const dates = [...selected].sort();
+    if (!dates.length) {
+      box.innerHTML = '<p class="small muted" style="margin:0">Pick one or more dates above first.</p>';
+      renderSummary();
+      return;
+    }
+    const len = +$('#length').value;
+    box.innerHTML = dates
+      .map((d) => {
+        const list = [...(times.get(d) || [])].sort((a, b) => a - b);
+        const chips = list
+          .map((m) => `<span class="chip time-chip">${esc(minutesLabel(m))}${len ? ` – ${esc(minutesLabel((m + len) % 1440))}` : ''}<button type="button" data-del="${d}|${m}" aria-label="Remove ${esc(minutesLabel(m))}">×</button></span>`)
+          .join('');
+        const sugg = suggestNext(d);
+        return `<div class="day-times">
+          <div class="day-times-head"><b>${esc(dayLabel(d))}</b>${list.length && dates.length > 1 ? `<button type="button" class="btn btn-sm btn-ghost" data-copy="${d}">Use these times on every day</button>` : ''}</div>
+          <div class="names">${chips || '<span class="small muted">No times yet</span>'}</div>
+          <div class="add-time">
+            <select data-time="${d}" aria-label="Time to add on ${esc(dayLabel(d))}">${timeChoices.map((m) => `<option value="${m}"${m === sugg ? ' selected' : ''}>${minutesLabel(m)}</option>`).join('')}</select>
+            <button type="button" class="btn btn-sm" data-add="${d}">+ Add time</button>
+          </div>
+        </div>`;
+      })
+      .join('');
+    renderSummary();
+  }
+
+  $('#times').addEventListener('click', (e) => {
+    const add = e.target.closest('[data-add]');
+    const del = e.target.closest('[data-del]');
+    const cp = e.target.closest('[data-copy]');
+    if (add) {
+      const d = add.dataset.add;
+      if (!times.has(d)) times.set(d, new Set());
+      times.get(d).add(+$(`[data-time="${d}"]`).value);
+      renderTimes();
+      $(`[data-add="${d}"]`)?.focus();
+    } else if (del) {
+      const [d, m] = del.dataset.del.split('|');
+      times.get(d)?.delete(+m);
+      renderTimes();
+    } else if (cp) {
+      const src = times.get(cp.dataset.copy);
+      for (const d of selected) times.set(d, new Set(src));
+      renderTimes();
+      toast('Copied to every selected day');
+    }
+  });
+  $('#length').onchange = renderTimes;
+
+  function proposedOptions() {
+    const len = +$('#length').value;
+    const tz = $('#tz').value;
+    const out = [];
+    for (const d of [...selected].sort())
+      for (const m of times.get(d) || []) {
+        const start = zonedToUtc(d, m, tz);
+        out.push({ start, end: start + len * MINUTE });
+      }
+    return out;
+  }
+
+  function renderSummary() {
+    const el = $('#summary');
+    if (mode !== 'options') return (el.textContent = '');
+    const n = proposedOptions().length;
+    const empty = [...selected].filter((d) => !times.get(d)?.size).length;
+    el.textContent = n
+      ? `${n} time${n === 1 ? '' : 's'} proposed${empty ? ` · ${empty} date${empty === 1 ? ' has' : 's have'} no times and will be skipped` : ''}`
+      : '';
   }
 
   // drag to select/deselect a run of dates
@@ -298,6 +420,7 @@ function renderCreate() {
   $('#slot').onchange = renderDurations;
   renderDurations();
   renderCal();
+  renderMode();
 
   $('#create').onsubmit = async (e) => {
     e.preventDefault();
@@ -313,24 +436,30 @@ function renderCreate() {
       err.textContent = 'Pick at least one date.';
       return;
     }
-    const organizer = $('#organizer').value.trim();
-    if (organizer) rememberName(organizer);
+    const common = { title, description: $('#desc').value, organizer: $('#organizer').value.trim(), timezone: $('#tz').value };
+    let body;
+    if (mode === 'options') {
+      const options = proposedOptions();
+      if (!options.length) {
+        err.textContent = 'Add at least one time to propose.';
+        $('[data-add]')?.focus();
+        return;
+      }
+      body = { ...common, mode: 'options', options };
+    } else {
+      body = {
+        ...common,
+        dates: [...selected],
+        startMinute: +$('#start').value,
+        endMinute: +$('#end').value,
+        slotMinutes: +$('#slot').value,
+        durationMinutes: +$('#duration').value,
+      };
+    }
+    if (common.organizer) rememberName(common.organizer);
     $('#submit').disabled = true;
     try {
-      const { id, adminToken } = await api('events', {
-        method: 'POST',
-        body: {
-          title,
-          description: $('#desc').value,
-          organizer,
-          timezone: $('#tz').value,
-          dates: [...selected],
-          startMinute: +$('#start').value,
-          endMinute: +$('#end').value,
-          slotMinutes: +$('#slot').value,
-          durationMinutes: +$('#duration').value,
-        },
-      });
+      const { id, adminToken } = await api('events', { method: 'POST', body });
       save(id, { adminToken, justCreated: true });
       navigate(`/e/${id}`);
     } catch (ex) {
@@ -387,6 +516,8 @@ async function renderEvent(id) {
 
   document.title = `${st.ev.title} · Overlap`;
   const shareUrl = `${location.origin}/e/${id}`;
+  const optionsMode = isOptionsPoll(st.ev);
+  st.touched = new Set(); // options this visitor explicitly answered (so "No" shows as chosen)
   const me = () => st.ev.participants.find((p) => p.id === saved(id).participantId);
 
   app.innerHTML = `
@@ -411,13 +542,22 @@ async function renderEvent(id) {
     </div>
     <div class="panels">
       <section class="card" aria-labelledby="mine-h">
-        <h2 id="mine-h">Your availability</h2>
+        <h2 id="mine-h">${optionsMode ? 'Which times work for you?' : 'Your availability'}</h2>
         <div class="stack">
           <div>
             <label for="name">Your name</label>
             <input id="name" type="text" maxlength="80" autocomplete="name">
           </div>
+${optionsMode ? `
           <div class="btn-row" style="justify-content:space-between">
+            <p class="small muted" style="margin:0">Answer each proposed time, then save.</p>
+            <div class="btn-row">
+              <span class="btn btn-sm file-btn" title="Check the proposed times against a calendar export (.ics)">Check my calendar<input type="file" id="ics" accept=".ics,text/calendar"></span>
+              <button type="button" class="btn btn-sm btn-ghost" id="fill">Yes to all</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="none">Clear</button>
+            </div>
+          </div>
+          <div id="mine" class="opt-list"></div>` : `<div class="btn-row" style="justify-content:space-between">
             <div class="segmented" role="group" aria-label="Brush">
               <button type="button" data-brush="${YES}"><span class="swatch swatch-yes"></span>Available</button>
               <button type="button" data-brush="${IF_NEEDED}"><span class="swatch swatch-maybe"></span>If needed</button>
@@ -430,7 +570,7 @@ async function renderEvent(id) {
             </div>
           </div>
           <p class="small muted" style="margin:0">Click and drag to paint the times you can make it. On a phone, tap or drag.</p>
-          <div class="grid-scroll"><div class="grid" id="mine" role="grid" aria-label="Your availability"></div></div>
+          <div class="grid-scroll"><div class="grid" id="mine" role="grid" aria-label="Your availability"></div></div>`}
         </div>
         <div class="save-bar">
           <span id="save-state" class="small"></span>
@@ -450,9 +590,9 @@ async function renderEvent(id) {
         <section class="card" aria-labelledby="group-h">
           <h2 id="group-h">Everyone</h2>
           <ul class="people" id="people"></ul>
-          <div class="grid-scroll" style="margin-top:12px"><div class="grid readonly" id="group" aria-label="Group availability"></div></div>
+          ${optionsMode ? '<div id="group" style="margin-top:12px"></div>' : `<div class="grid-scroll" style="margin-top:12px"><div class="grid readonly" id="group" aria-label="Group availability"></div></div>
           <div class="legend" id="legend"></div>
-          <div class="hover-info" id="inspect"></div>
+          <div class="hover-info" id="inspect"></div>`}
         </section>
       </div>
     </div>
@@ -513,13 +653,140 @@ async function renderEvent(id) {
   const mineEl = $('#mine');
   const mineClass = (s) => (st.mine[s] === YES ? 'yes' : st.mine[s] === IF_NEEDED ? 'maybe' : '');
 
+  // ----- specific-times polls: vote on each option -----
+  function optionsByDay() {
+    const days = new Map();
+    for (const o of st.ev.options) {
+      const d = utcToZoned(o.start, st.tz).date;
+      if (!days.has(d)) days.set(d, []);
+      days.get(d).push(o);
+    }
+    return days;
+  }
+  const dayName = (d) => `${fmtDow.format(dateParts(d))}, ${fmtMonthDay.format(dateParts(d))}`;
+  function optTime(o) {
+    const t = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', timeZone: st.tz });
+    return `${t.format(o.start)} – ${t.format(o.end)}`;
+  }
+
+  function renderMineOptions() {
+    let h = '';
+    for (const [d, opts] of optionsByDay()) {
+      h += `<div class="opt-day"><div class="opt-day-label">${esc(dayName(d))}</div>`;
+      for (const o of opts)
+        h += `<div class="opt${o.start === st.ev.finalStart ? ' final' : ''}" data-opt="${o.start}">
+          <div class="opt-main">
+            <div class="opt-time">${esc(optTime(o))}${o.start === st.ev.finalStart ? ' <span class="badge">Picked</span>' : ''}</div>
+            <div class="opt-tally"></div>
+          </div>
+          <div class="vote" role="radiogroup" aria-label="${esc(fmtRange(o.start, o.end, st.tz))}">
+            <button type="button" role="radio" data-vote="${YES}" class="v-yes">✓ Yes</button>
+            <button type="button" role="radio" data-vote="${IF_NEEDED}" class="v-maybe">If needed</button>
+            <button type="button" role="radio" data-vote="0" class="v-no">✕ No</button>
+          </div>
+        </div>`;
+      h += '</div>';
+    }
+    mineEl.innerHTML = h;
+    refreshMineOptions();
+  }
+
+  function refreshMineOptions() {
+    const people = others();
+    const n = Math.max(people.length, 1);
+    const answeredBefore = !!me();
+    for (const el of mineEl.querySelectorAll('[data-opt]')) {
+      const s = el.dataset.opt;
+      const v = st.mine[s] || 0;
+      const shown = v > 0 || answeredBefore || st.touched.has(s) ? v : -1;
+      el.dataset.v = shown;
+      for (const b of el.querySelectorAll('[data-vote]')) b.setAttribute('aria-checked', +b.dataset.vote === shown);
+      const yes = people.filter((p) => p.availability[s] === YES).length;
+      const maybe = people.filter((p) => p.availability[s] === IF_NEEDED).length;
+      el.querySelector('.opt-tally').innerHTML = people.length
+        ? `<span class="tally-bar"><span class="y" style="width:${(100 * yes) / n}%"></span><span class="m" style="width:${(100 * maybe) / n}%"></span></span><span class="small muted">${yes} yes${maybe ? ` · ${maybe} if needed` : ''}</span>`
+        : '';
+    }
+  }
+
+  function renderGroupOptions() {
+    const box = $('#group');
+    const people = others();
+    if (!people.length) {
+      box.innerHTML = '<p class="muted" style="margin:0">Nobody has responded yet. Share the link to get started.</p>';
+      return;
+    }
+    const opts = st.ev.options;
+    const top = rankTimes(st.ev, st.ev.slots, people, 1)[0];
+    const topCount = top ? top.yes.length + top.ifNeeded.length : -1;
+    const isTop = (o) => {
+      const c = people.filter((p) => p.availability[o.start]).length;
+      return c === topCount && c > 0;
+    };
+    const cls = (o) => [isTop(o) ? 'top' : '', o.start === st.ev.finalStart ? 'final' : ''].join(' ');
+    const head = opts
+      .map((o) => {
+        const z = utcToZoned(o.start, st.tz);
+        return `<th class="${cls(o)}" scope="col"><span class="m-day">${esc(fmtDow.format(dateParts(z.date)))} ${esc(fmtMonthDay.format(dateParts(z.date)))}</span><span class="m-time">${esc(optTime(o).split(' – ')[0])}</span></th>`;
+      })
+      .join('');
+    const myId = me()?.id;
+    const rows = people
+      .map((p) => {
+        const cells = opts
+          .map((o) => {
+            const v = p.availability[o.start];
+            return v === YES
+              ? `<td class="m-yes ${cls(o)}" title="Yes">✓</td>`
+              : v === IF_NEEDED
+                ? `<td class="m-maybe ${cls(o)}" title="If needed">(✓)</td>`
+                : `<td class="m-no ${cls(o)}" title="No"></td>`;
+          })
+          .join('');
+        return `<tr class="${p.id === st.focus ? 'focus' : ''}"><th scope="row">${esc(p.name)}${p.id === myId ? ' <span class="muted">(you)</span>' : ''}</th>${cells}</tr>`;
+      })
+      .join('');
+    const totals = opts
+      .map((o) => {
+        const y = people.filter((p) => p.availability[o.start] === YES).length;
+        const m = people.filter((p) => p.availability[o.start] === IF_NEEDED).length;
+        const pick = st.ev.isAdmin && o.start !== st.ev.finalStart ? `<button class="btn btn-sm m-pick" data-pick="${o.start}">Pick</button>` : '';
+        return `<td class="${cls(o)}"><b>${y + m}</b>${m ? `<span class="muted small"> (${m}~)</span>` : ''}${pick}</td>`;
+      })
+      .join('');
+    box.innerHTML = `<div class="matrix-scroll"><table class="matrix">
+      <thead><tr><th></th>${head}</tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot><tr><th scope="row">Can make it</th>${totals}</tr></tfoot>
+    </table></div>
+    <p class="small muted" style="margin:8px 0 0">✓ yes · (✓) if needed. The most popular times are highlighted.</p>`;
+  }
+
+  if (optionsMode) {
+    $('#mine').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-vote]');
+      if (!b) return;
+      const s = b.closest('[data-opt]').dataset.opt;
+      const v = +b.dataset.vote;
+      if (v) st.mine[s] = v;
+      else delete st.mine[s];
+      st.touched.add(s);
+      refreshMine();
+      setDirty(true);
+      renderGroup();
+      renderBest();
+    });
+  }
+
   function renderMine() {
+    if (optionsMode) return renderMineOptions();
     mineEl.style.gridTemplateColumns = gridCols();
     mineEl.innerHTML = gridHtml((s) => mineClass(s) + (finalSet().has(s) ? ' final' : ''));
     const first = mineEl.querySelector('.cell[data-slot]');
     if (first) first.tabIndex = 0;
   }
   function refreshMine() {
+    if (optionsMode) return refreshMineOptions();
     for (const el of mineEl.querySelectorAll('.cell[data-slot]')) {
       const v = st.mine[el.dataset.slot];
       el.classList.toggle('yes', v === YES);
@@ -626,11 +893,11 @@ async function renderEvent(id) {
     e.target.value = '';
     if (!file) return;
     try {
-      const slots = st.ev.slots;
-      const slotMs = st.ev.slotMinutes * MINUTE;
-      const busy = parseIcsBusy(await file.text(), slots[0], slots[slots.length - 1] + slotMs, st.tz);
+      const windows = eventWindows(st.ev);
+      const busy = parseIcsBusy(await file.text(), windows[0].start, Math.max(...windows.map((w) => w.end)), st.tz);
       if (Object.keys(st.mine).length && !confirm('Replace what you have painted with the free times from your calendar?')) return;
-      st.mine = availabilityFromBusy(slots, st.ev.slotMinutes, busy);
+      st.mine = availabilityFromBusy(windows, busy);
+      for (const w of windows) st.touched.add(String(w.start));
       refreshMine();
       setDirty(true);
       const free = Object.keys(st.mine).length;
@@ -722,6 +989,7 @@ async function renderEvent(id) {
   const others = () => st.ev.participants.map((p) => (p.id === me()?.id ? { ...p, availability: st.mine } : p));
 
   function renderGroup() {
+    if (optionsMode) return renderGroupOptions();
     const people = others();
     const n = people.length;
     const fs = finalSet();
@@ -753,6 +1021,7 @@ async function renderEvent(id) {
 
   function renderInspect() {
     const box = $('#inspect');
+    if (!box) return;
     const people = others();
     if (!people.length) {
       box.innerHTML = '<p class="muted" style="margin:0">Nobody has responded yet. Share the link to get started.</p>';
@@ -835,11 +1104,11 @@ async function renderEvent(id) {
     const n = people.length;
     const lenText = lengthLabel(st.ev.durationMinutes);
     if (!n || !best.length) {
-      $('#best').innerHTML = `<p class="muted" style="margin:0">${n ? 'No time works for anyone yet.' : `Best times for a ${lenText} meeting will show up here as people respond.`}</p>`;
+      $('#best').innerHTML = `<p class="muted" style="margin:0">${n ? 'No time works for anyone yet.' : optionsMode ? 'The most popular times will show up here as people respond.' : `Best times for a ${lenText} meeting will show up here as people respond.`}</p>`;
       return;
     }
     $('#best').innerHTML = `
-      <p class="small muted">For a ${lenText} meeting, ranked by how many people can make all of it.</p>
+      <p class="small muted">${optionsMode ? 'Ranked by how many people can make it, then by how many said a firm yes.' : `For a ${lenText} meeting, ranked by how many people can make all of it.`}</p>
       <ol class="best">${best
         .map((b) => {
           const notes = [];
@@ -879,7 +1148,7 @@ async function renderEvent(id) {
     const ev = st.ev;
     let h = '';
     if (ev.finalStart != null) {
-      const end = ev.finalStart + ev.durationMinutes * MINUTE;
+      const end = meetingEnd(ev, ev.finalStart);
       const info = { title: ev.title, description: [ev.description, shareUrl].filter(Boolean).join('\n\n'), start: ev.finalStart, end };
       h += `<div class="banner banner-final">
         <strong>📅 ${esc(fmtRange(ev.finalStart, end, st.tz))}</strong>
@@ -896,7 +1165,7 @@ async function renderEvent(id) {
       const fresh = saved(id).justCreated;
       h += `<div class="banner banner-admin">
         <strong>${fresh ? 'Your poll is ready. Share the link above.' : "You're the organizer"}</strong>
-        <p class="small" style="margin:0 0 8px">Pick the final time from "Best times" or by tapping any time in the group grid. To manage this poll from another device, bookmark your private organizer link, and don't share it.</p>
+        <p class="small" style="margin:0 0 8px">${optionsMode ? 'Pick the final time from "Best times" or from the responses table.' : 'Pick the final time from "Best times" or by tapping any time in the group grid.'} To manage this poll from another device, bookmark your private organizer link, and don't share it.</p>
         <div class="btn-row">
           <button class="btn btn-sm" id="copy-admin">Copy organizer link</button>
           <button class="btn btn-sm btn-ghost btn-danger" id="delete-poll">Delete poll</button>
@@ -925,7 +1194,7 @@ async function renderEvent(id) {
     $('#ev-title').textContent = ev.title;
     const meta = [];
     if (ev.organizer) meta.push(`by ${ev.organizer}`);
-    meta.push(`${lengthLabel(ev.durationMinutes)} meeting`);
+    meta.push(optionsMode ? `${ev.options.length} proposed time${ev.options.length === 1 ? '' : 's'}` : `${lengthLabel(ev.durationMinutes)} meeting`);
     meta.push(`${ev.participants.length} response${ev.participants.length === 1 ? '' : 's'}`);
     $('#ev-meta').innerHTML = esc(meta.join(' · ')) + (ev.description ? `<br><span style="white-space:pre-wrap">${esc(ev.description)}</span>` : '');
     $('#tz-note').textContent = st.tz === ev.timezone ? '' : `Organizer's time zone: ${ev.timezone.replace(/_/g, ' ')}`;

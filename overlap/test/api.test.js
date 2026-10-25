@@ -81,6 +81,21 @@ test('full poll lifecycle', async () => {
   assert.equal((await call(`/api/events/${id}`)).status, 404);
 });
 
+test('specific-times poll: votes and finalize use the option end', async () => {
+  const start = Date.UTC(2026, 10, 4, 15);
+  const { data } = await call('/api/events', {
+    method: 'POST',
+    body: { title: 'Lunch', timezone: 'UTC', mode: 'options', options: [{ start, end: start + 45 * 60_000 }, { start: start + 86_400_000, end: start + 86_400_000 + 3_600_000 }] },
+  });
+  const ev = (await call(`/api/events/${data.id}`)).data;
+  assert.deepEqual(ev.slots, [start, start + 86_400_000]);
+  const vote = await call(`/api/events/${data.id}/participants`, { method: 'POST', body: { name: 'Ann', availability: { [start]: 2, [start + 86_400_000]: 1 } } });
+  assert.equal(vote.status, 201);
+  await call(`/api/events/${data.id}/finalize`, { method: 'POST', body: { start }, headers: { 'x-admin-token': data.adminToken } });
+  const ics = await call(`/api/events/${data.id}/event.ics`);
+  assert.match(ics.data, /DTEND:20261104T154500Z/);
+});
+
 test('validation errors come back as 400', async () => {
   const r = await call('/api/events', { method: 'POST', body: { ...newEvent, dates: [] } });
   assert.equal(r.status, 400);
